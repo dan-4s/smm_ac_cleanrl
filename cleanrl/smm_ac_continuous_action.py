@@ -32,14 +32,14 @@ class Args:
     """the wandb's project name"""
     wandb_entity: str = "gauthier-gidel"
     """the entity (team) of wandb's project"""
-    wandb_group: str = "SAC"
+    wandb_group: str = "SMM"
     """The group of an individual run, indexed by the algorithm and subcategories therein."""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
-    """The value estimation method."""
+    smm_value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
+    """The value estimation method for SMM."""
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
     total_timesteps: int = 1000000
@@ -58,15 +58,21 @@ class Args:
     """timestep to start learning"""
     policy_lr: float = 3e-4
     """the learning rate of the policy network optimizer"""
+    pi_ref_lr: float = 3e-5
+    """learning rate of the reference policy"""
     q_lr: float = 1e-3
     """the learning rate of the Q network network optimizer"""
     policy_frequency: int = 2
     """the frequency of training policy (delayed)"""
+    ref_policy_frequency: int = 2
+    """the frequency of training the reference policy (delayed)"""
     target_network_frequency: int = 1  # Denis Yarats' implementation delays this by 2.
     """the frequency of updates for the target nerworks"""
-    alpha: float = 0.2
-    """Entropy regularization coefficient."""
-    autotune: bool = True
+    alpha: float = 1
+    """Distribution spikeyness hyperparameter."""
+    omega: float = 5.0
+    """Temperature hyperparameter."""
+    autotune: bool = False
     """automatic tuning of the entropy coefficient"""
 
 
@@ -90,7 +96,6 @@ def weighted_log_sum_exp(value, weights, dim=None):
         m, idx = torch.max(value, dim=dim)
         return m.squeeze(dim) + torch.log(torch.sum(torch.exp(value-m)*(weights),
                                        dim=dim) + eps)
-
 
 class SoftQNetwork(nn.Module):
     def __init__(self, env):
@@ -159,7 +164,20 @@ class Actor(nn.Module):
         log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(1, keepdim=True)
         mean = torch.tanh(mean) * self.action_scale + self.action_bias
-        return action, log_prob, mean
+        return action, log_prob, mean, x_t
+    
+    # TODO: Verify that the below method is correct...
+    def get_log_prob(self, x, x_t):
+        """The naming convention here is fucked, but I'll stick with it for now..."""
+        mean, log_std = self(x)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        y_t = torch.tanh(x_t)
+        log_prob = normal.log_prob(x_t)
+        # Enforcing Action Bound
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(1, keepdim=True)
+        return log_prob
 
 
 if __name__ == "__main__":
@@ -201,6 +219,7 @@ if __name__ == "__main__":
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
+    pi_ref = Actor(envs).to(device)
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
@@ -209,6 +228,7 @@ if __name__ == "__main__":
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    pi_ref_optimizer = optim.Adam(list(pi_ref.parameters()), lr=args.pi_ref_lr) # Want pi_ref to move very slowly!
 
     # Automatic entropy tuning
     if args.autotune:
@@ -218,6 +238,7 @@ if __name__ == "__main__":
         a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
         alpha = args.alpha
+        omega = args.omega
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -237,7 +258,7 @@ if __name__ == "__main__":
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
-            actions, _, _ = actor.get_action(torch.Tensor(obs).to(device))
+            actions, _, _, _ = actor.get_action(torch.Tensor(obs).to(device))
             actions = actions.detach().cpu().numpy()
 
         # TRY NOT TO MODIFY: execute the game and log data.
@@ -266,29 +287,47 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                if(args.value_est == "explicit_regulariser"):
-                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                elif(args.value_est == "empirical_expectation"):
+                # Estimate the value of the next state.
+                if(args.smm_value_est == "explicit_regulariser"):
+                    # Similarly to SAC, generate the value estimate by taking:
+                    # Q(s, a) - temp * regulariser.
+                    # NOTE: We need the random_sample because it is the action
+                    # estimate generated from the actor's normal distribution. To
+                    # then get pi_ref's log_prob for that action, we need to have
+                    # the sample on the domain of the normal distribution.
+                    next_state_actions, next_state_log_pi, _, random_sample = actor.get_action(data.next_observations)
+                    next_state_log_pi_ref = pi_ref.get_log_prob(data.next_observations, random_sample)
+                    qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                    qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                    min_qf_next_target = (
+                        torch.min(qf1_next_target, qf2_next_target) -
+                        (1/omega) * (next_state_log_pi - next_state_log_pi_ref) )
+                elif(args.smm_value_est == "empirical_expectation"):
+                    # TODO: LMFAO JUST USE LOG-SUM-EXP!!!!! Weight the sum with 1/n obvs.
+                    # Estimate the value by taking:
+                    # temp * log( empirical_expectation[ exp(1/temp * Q(s,a)) ] )
+                    # Start out with a single sample, add more if unstable.
+                    # Averaging is quite unstable, as it turns out haha.
                     qs = []
-                    weights = []
                     # import pdb
                     # pdb.set_trace()
                     N = 5
                     for _ in range(N):
-                        pi_action, log_pi, _ = actor.get_action(data.next_observations)
-                        qf1_next_target = qf1_target(data.next_observations, pi_action)
-                        qf2_next_target = qf2_target(data.next_observations, pi_action)
+                        pi_ref_action, log_pi_ref, _, _ = pi_ref.get_action(data.next_observations)
+                        qf1_next_target = qf1_target(data.next_observations, pi_ref_action)
+                        qf2_next_target = qf2_target(data.next_observations, pi_ref_action)
                         q_est = torch.min(qf1_next_target, qf2_next_target)
-                        qs.append(q_est / alpha)
-                        weights.append(1 / torch.exp(log_pi))
+                        qs.append(omega * q_est)
                     qs = torch.stack(qs).squeeze(0)
-                    weights = torch.stack(weights).squeeze(0)
-                    min_qf_next_target = alpha * weighted_log_sum_exp(qs, weights/N, dim=0)
+                    min_qf_next_target = (1/omega) * weighted_log_sum_exp(qs, 1/N, dim=0)
+                    # min_qf_next_target = min_qf_next_target
+                    # pi_ref_action, log_pi_ref, _, _ = pi_ref.get_action(data.next_observations)
+                    # qf1_next_target = qf1_target(data.next_observations, pi_ref_action)
+                    # qf2_next_target = qf2_target(data.next_observations, pi_ref_action)
+                    # q_est = torch.min(qf1_next_target, qf2_next_target)
+                    # min_qf_next_target = q_est
                 else:
-                    raise ValueError(f"Value estimator {args.value_est} is not recognised.")
+                    raise ValueError(f"Value estimator {args.smm_value_est} is not recognised.")
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
@@ -303,14 +342,23 @@ if __name__ == "__main__":
             q_optimizer.step()
 
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+                # Update the policy.
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
-                    pi, log_pi, _ = actor.get_action(data.observations)
-                    qf1_pi = qf1(data.observations, pi)
-                    qf2_pi = qf2(data.observations, pi)
+                    act, log_pi, _, random_sample = actor.get_action(data.observations)
+                    qf1_pi = qf1(data.observations, act)
+                    qf2_pi = qf2(data.observations, act)
                     min_qf_pi = torch.min(qf1_pi, qf2_pi)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                    with torch.no_grad():
+                        # log_pi_ref must not provide gradients to the Actor
+                        log_pi_ref = pi_ref.get_log_prob(data.observations, random_sample) 
+
+                    # KL-regularized loss
+                    # We minimize: KL(pi || pi_ref) - omega * Q
+                    # Rewritten: (1/omega) * (log_pi - log_pi_ref) - min_qf_pi
+                    actor_loss = ((1.0 / args.omega) * (log_pi - log_pi_ref) - min_qf_pi).mean()
+                    # actor_loss = (((alpha + omega) * log_pi) - min_qf_pi).mean() -> old method, didn't explicitly separate pi_ref and actor.
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
@@ -318,13 +366,32 @@ if __name__ == "__main__":
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(data.observations)
+                            _, log_pi, _, _ = actor.get_action(data.observations)
                         alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
 
                         a_optimizer.zero_grad()
                         alpha_loss.backward()
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
+            
+            if global_step % args.ref_policy_frequency == 0:  # TD 3 Delayed update support
+                # Update the reference policy.
+                for _ in range(
+                    args.ref_policy_frequency
+                ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                    # Try training pi_ref with the data sampled from pi.
+                    act_ref, log_pi_ref, _, _ = pi_ref.get_action(data.observations)
+                    # with torch.no_grad():
+                    # The Q-values shouldn't provide gradients to pi_ref.
+                    qf1_pi = qf1(data.observations, act_ref)
+                    qf2_pi = qf2(data.observations, act_ref)
+                    min_qf_pi = torch.min(qf1_pi, qf2_pi)
+                    # Try training pi_ref with the data sampled from pi.
+                    pi_ref_loss = ((log_pi_ref) - alpha * min_qf_pi).mean()
+
+                    pi_ref_optimizer.zero_grad()
+                    pi_ref_loss.backward()
+                    pi_ref_optimizer.step()
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
@@ -340,6 +407,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
                 writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+                writer.add_scalar("losses/pi_ref_loss", pi_ref_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar(
