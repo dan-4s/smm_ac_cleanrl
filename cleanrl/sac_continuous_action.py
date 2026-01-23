@@ -40,6 +40,8 @@ class Args:
     # Algorithm specific arguments
     value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
     """The value estimation method."""
+    num_val_est_samples: int = 5 
+    """The number of samples collected for the value estimate, when empirical_expectation"""
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
     total_timesteps: int = 1000000
@@ -266,17 +268,25 @@ if __name__ == "__main__":
         if global_step > args.learning_starts:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                 if(args.value_est == "explicit_regulariser"):
-                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                    qs = []
+                    weights = []
+                    # import pdb
+                    # pdb.set_trace()
+                    N = args.num_val_est_samples
+                    for _ in range(N):
+                        next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
+                        qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                        qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                        qs.append(torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi)
+                    qs = torch.stack(qs).squeeze(0)
+                    min_qf_next_target = torch.mean(qs, dim=0)
                 elif(args.value_est == "empirical_expectation"):
                     qs = []
                     weights = []
                     # import pdb
                     # pdb.set_trace()
-                    N = 5
+                    N = args.num_val_est_samples
                     for _ in range(N):
                         pi_action, log_pi, _ = actor.get_action(data.next_observations)
                         qf1_next_target = qf1_target(data.next_observations, pi_action)
