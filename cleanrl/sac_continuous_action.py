@@ -18,8 +18,10 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    wandb_run_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+    output_filename: str = "results/out"
+    "the name of the results file where we store run data"
     seed: int = int.from_bytes(os.urandom(4), "little")
     """seed of the experiment"""
     torch_deterministic: bool = True

@@ -9,9 +9,14 @@
 
 mkdir -p logs
 
+# Create the results directory if it doesn't exist
+RESULTS_DIR=results_january_23
+mkdir -p $RESULTS_DIR
+
 # 1. Define parameter arrays
-pi_ref_learning_rates=(1e-6 5e-6 1e-5 3e-5 5e-5) # Length: 5
-pi_ref_freq=(2 4 6)                             # Length: 3
+pi_ref_learning_rates=(1e-6 5e-6 1e-5 5e-5) # Length: 4
+pi_ref_freq=(2 4 6)                         # Length: 3
+num_val_est_samples=(1 2 5)                 # Length: 3
 NUM_REPEATS=10
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
@@ -31,7 +36,7 @@ PI_REF_LR=${pi_ref_learning_rates[$i_lr]}
 REF_FREQ=${pi_ref_freq[$i_freq]}
 
 # Fixed values
-SMM_VAL="empirical_expectation"
+SMM_VAL="explicit_regulariser" # explicit_regulariser OR empirical_expectation
 ALPHA=1
 OMEGA=5
 

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,8 +20,10 @@ from cleanrl_utils.buffers import ReplayBuffer
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    wandb_run_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
+    output_filename: str = "test_results"
+    "the name of the results file where we store run data"
     seed: int = int.from_bytes(os.urandom(4), "little")
     """seed of the experiment"""
     torch_deterministic: bool = True
@@ -90,6 +94,16 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         return env
 
     return thunk
+
+
+def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
+    table = pa.Table.from_pydict(run_data)
+    writer.write_table(table)
+
+    # Clear the dictionary so RAM doesn't grow!
+    for key in run_data:
+        run_data[key] = []
+
 
 
 # ALGO LOGIC: initialize agent here:
@@ -185,7 +199,7 @@ class Actor(nn.Module):
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}"
+    run_name = f"{args.env_id}__{args.wandb_run_name}"
     if args.track:
         import wandb
 
@@ -203,6 +217,23 @@ if __name__ == "__main__":
         "hyperparameters",
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
+
+    # For data logging.
+    run_data = {
+        "episodic_return": [],
+        "episodic_length": [],
+        "episodic_step": [],
+    }
+    schema = pa.schema([
+        ("episodic_return", pa.float64()), # List of floats
+        ("episodic_length", pa.int64()),   # List of ints
+        ("episodic_step", pa.int64()),     # The global step
+    ])
+    if(args.autotune):
+        run_data["alpha_loss"] = []
+    table = pa.Table.from_pydict(run_data)
+    output_filename = args.output_filename + ".parquet"
+    parquet_writer = pq.ParquetWriter(output_filename, schema)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -273,6 +304,9 @@ if __name__ == "__main__":
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                     writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                     writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    run_data["episodic_return"].append(float(info["episode"]["r"][0]))
+                    run_data["episodic_length"].append(int(info["episode"]["l"][0]))
+                    run_data["episodic_step"].append(int(global_step))
                     break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -410,6 +444,8 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
+                sps = int(global_step / (time.time() - start_time))
+                print("SPS:", sps)
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
@@ -418,14 +454,14 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/pi_ref_loss", pi_ref_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
+                writer.add_scalar("charts/SPS", sps, global_step)
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+            
+            if(global_step % 10_000 == 0):
+                write_and_dump(writer=parquet_writer, run_data=run_data)
 
+    write_and_dump(writer=parquet_writer, run_data=run_data)
+    parquet_writer.close()
     envs.close()
     writer.close()
