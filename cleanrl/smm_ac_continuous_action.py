@@ -42,7 +42,7 @@ class Args:
     """whether to capture videos of the agent performances (check out `videos` folder)"""
 
     # Algorithm specific arguments
-    smm_value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
+    value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
     """The value estimation method for SMM."""
     num_val_est_samples: int = 5 
     """The number of samples collected for the value estimate, when empirical_expectation"""
@@ -103,7 +103,6 @@ def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
     # Clear the dictionary so RAM doesn't grow!
     for key in run_data:
         run_data[key] = []
-
 
 
 # ALGO LOGIC: initialize agent here:
@@ -199,7 +198,7 @@ class Actor(nn.Module):
 if __name__ == "__main__":
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.wandb_run_name}"
+    run_name = args.wandb_run_name
     if args.track:
         import wandb
 
@@ -229,8 +228,6 @@ if __name__ == "__main__":
         ("episodic_length", pa.int64()),   # List of ints
         ("episodic_step", pa.int64()),     # The global step
     ])
-    if(args.autotune):
-        run_data["alpha_loss"] = []
     table = pa.Table.from_pydict(run_data)
     output_filename = args.output_filename + ".parquet"
     parquet_writer = pq.ParquetWriter(output_filename, schema)

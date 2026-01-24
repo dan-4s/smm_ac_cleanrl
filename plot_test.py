@@ -81,7 +81,7 @@ def process_flat_parquet(file_pattern, grid_points=1000):
 
 if __name__ == "__main__":
    # Usage
-    common_grid, mean_line, median_line, std_line = process_flat_parquet("test_results_*.parquet")
+    common_grid, mean_line, median_line, std_line = process_flat_parquet("results_january_23/Hopper-v4__SMM_lr=5e-6_ref_freq=6_N=5/*.parquet")
     plt.plot(common_grid, mean_line, label="mean of EMAs")
     plt.plot(common_grid, median_line, label="median of EMAs")
     plt.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
