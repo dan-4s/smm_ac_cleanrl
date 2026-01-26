@@ -9,7 +9,7 @@
 
 mkdir -p logs
 
-RESULTS_DIR=results_january_23
+RESULTS_DIR=results_january_25_N_1
 mkdir -p $RESULTS_DIR
 
 # 1. Define parameter arrays

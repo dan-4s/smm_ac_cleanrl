@@ -1,46 +1,21 @@
-import polars as pl
+"""Plotting script for local parquet files."""
+
+# Imports
+from absl import app
+from absl import flags
 import glob
-import pandas as pd
-import pyarrow.parquet as pq
 import numpy as np
 import matplotlib.pyplot as plt
+import os
+import pandas as pd
+import polars as pl
 
-def process_nested_parquet(file_pattern, grid_step=100):
-    # 1. Load and "Explode" the lists
-    # include_file_paths identifies which of the 10 files each row came from
-    lazy_df = (
-        pl.scan_parquet(file_pattern, include_file_paths="run_id")
-        .explode(["episodic_return", "episodic_length"])
-    )
-    
-    df = lazy_df.collect().to_pandas()
+# Constants
+PLOT_N = [2, 5]
+PLOT_LR = ["1e-6","5e-6", "1e-5", "5e-5"]
+PLOT_REF_FREQ = [2, 4, 6]
+BASELINES = ["SAC"]
 
-    # 2. Setup the common grid for averaging
-    # We want a shared X-axis from the earliest step to the latest
-    min_s, max_s = df["episodic_step"].min(), df["episodic_step"].max()
-    common_grid = np.arange(min_s, max_s, grid_step)
-
-    # 3. Interpolate each run onto the grid
-    run_results = []
-    for rid in df["run_id"].unique():
-        subset = df[df["run_id"] == rid].sort_values("episodic_step")
-        
-        # We map the irregular 'episodic_step' to our 'common_grid'
-        interp_vals = np.interp(common_grid, subset["episodic_step"], subset["episodic_return"])
-        
-        run_results.append(pd.DataFrame({
-            "step": common_grid,
-            "return": interp_vals
-        }))
-
-    # 4. Aggregate across the 10 runs
-    all_runs_df = pd.concat(run_results)
-    final_df = all_runs_df.groupby("step")["return"].agg(["mean", "std"]).reset_index()
-
-    # 5. Apply the EMA (0.99 coefficient -> alpha 0.01)
-    final_df["ema"] = final_df["mean"].ewm(alpha=1-0.99).mean()
-    
-    return final_df
 
 def process_flat_parquet(file_pattern, grid_points=1000):
     # 1. Load data - No explode needed!
@@ -77,17 +52,59 @@ def process_flat_parquet(file_pattern, grid_points=1000):
     # 0.99 smoothing coefficient translates to alpha = 0.01
     # ema_line = pd.Series(mean_line).ewm(alpha=0.01).mean().values
 
-    return common_grid, mean_line, median_line, std_line
+    return common_grid, mean_line, median_line, std_line, matrix
+
+
+# Define the flags for command line input.
+FLAGS = flags.FLAGS
+flags.DEFINE_string("folder", "results", "The results folder to put the plots in.")
+flags.DEFINE_string("task", "Hopper-v4", "The task for which to compile graphs.")
+def plot_data(_):
+    folder = FLAGS.folder
+    if(not os.path.exists(folder)):
+        os.mkdir(folder)
+    if(not os.path.exists(f"{folder}/plots")):
+        os.mkdir(f"{folder}/plots")
+    
+    # Ensure that there exist results files under the results folder.
+    task = FLAGS.task
+    if(len(glob.glob(f"{folder}/{task}*")) == 0):
+        raise ValueError(f"There does not exist any results of the form: {folder}/{task}*")
+    
+    # Get ready to plot for each value of N.
+    num_plots = len(PLOT_N)
+    fig, axs = plt.subplots(1, num_plots, sharey=True)
+    fig.set_size_inches(5*num_plots, 5)
+
+    # Plot for each N.
+    for idx, N in enumerate(PLOT_N):
+        axis_idx = axs[idx] if(num_plots > 1) else axs
+        # First, plot the baselines.
+        for baseline in BASELINES:
+            if(baseline == "SAC"):
+                baseline = f"SAC_N={N}"
+            common_grid, mean_line, _, std_line, _ = process_flat_parquet(
+                f"{folder}/{task}__{baseline}/*.parquet")
+            axis_idx.plot(common_grid, mean_line, label=baseline, marker="^", markevery=50)
+            # axis_idx.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
+        
+        # Then, plot all the relevant results.
+        for lr in PLOT_LR:
+            for ref_freq in PLOT_REF_FREQ:
+                common_grid, mean_line, _, std_line, _ = process_flat_parquet(
+                    f"{folder}/{task}__SMM_lr={lr}_ref_freq={ref_freq}_N={N}/*.parquet")
+                axis_idx.plot(common_grid, mean_line, label=f"SMM_lr={lr}_ref_freq={ref_freq}")
+                # axis_idx.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
+    
+        axis_idx.set_title(f"SMM-AC vs. SAC with N={N} on Hopper-v4")
+        axis_idx.set_xlabel("Steps")
+        axis_idx.set_ylabel("Average episodic return")
+        axis_idx.grid()
+    axis_idx.legend(bbox_to_anchor=(1.05, 1)) # Use the last axis to put the legend.
+    fig.savefig(f"{folder}/plots/{task}.png", bbox_inches='tight')
+    plt.close()
+    
 
 if __name__ == "__main__":
-   # Usage
-    common_grid, mean_line, median_line, std_line = process_flat_parquet("results_january_23/Hopper-v4__SMM_lr=5e-6_ref_freq=6_N=5/*.parquet")
-    plt.plot(common_grid, mean_line, label="mean of EMAs")
-    plt.plot(common_grid, median_line, label="median of EMAs")
-    plt.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
-    # tab1 = pq.read_table("test_results_1.parquet")
-    # plt.plot(tab1["episodic_step"].to_pylist(), tab1["episodic_return"].to_pylist(), label="line1")
-    # tab2 = pq.read_table("test_results_2.parquet")
-    # plt.plot(tab2["episodic_step"].to_pylist(), tab2["episodic_return"].to_pylist(), label="line2")
-    plt.legend()
-    plt.savefig("test_results.png")
+    app.run(plot_data)
+
