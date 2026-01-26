@@ -13,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
 
@@ -205,17 +204,12 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False, # Fuck tensorboard lmfao (accidental DDOS).
             config=vars(args),
             name=run_name,
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
 
     # For data logging.
     run_data = {
@@ -299,8 +293,11 @@ if __name__ == "__main__":
             for info in infos["final_info"]:
                 if info is not None:
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    if args.track:
+                        wandb.log({
+                            "charts/episodic_return": info["episode"]["r"],
+                            "charts/episodic_length": info["episode"]["l"],
+                        }, step=global_step)
                     run_data["episodic_return"].append(float(info["episode"]["r"][0]))
                     run_data["episodic_length"].append(int(info["episode"]["l"][0]))
                     run_data["episodic_step"].append(int(global_step))
@@ -321,7 +318,7 @@ if __name__ == "__main__":
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 # Estimate the value of the next state.
-                if(args.smm_value_est == "explicit_regulariser"):
+                if(args.value_est == "explicit_regulariser"):
                     # Similarly to SAC, generate the value estimate by taking:
                     # Q(s, a) - temp * regulariser.
                     # NOTE: We need the random_sample because it is the action
@@ -341,8 +338,9 @@ if __name__ == "__main__":
                             torch.min(qf1_next_target, qf2_next_target) -
                             (1/omega) * (next_state_log_pi - next_state_log_pi_ref) )
                     qs = torch.stack(qs).squeeze(0)
-                    min_qf_next_target = torch.mean(qs, dim=0)
-                elif(args.smm_value_est == "empirical_expectation"):
+                    # Avoid the mean if single-sample estimator.
+                    min_qf_next_target = torch.mean(qs, dim=0) if(N > 1) else qs
+                elif(args.value_est == "empirical_expectation"):
                     # TODO: LMFAO JUST USE LOG-SUM-EXP!!!!! Weight the sum with 1/n obvs.
                     # Estimate the value by taking:
                     # temp * log( empirical_expectation[ exp(1/temp * Q(s,a)) ] )
@@ -367,7 +365,7 @@ if __name__ == "__main__":
                     # q_est = torch.min(qf1_next_target, qf2_next_target)
                     # min_qf_next_target = q_est
                 else:
-                    raise ValueError(f"Value estimator {args.smm_value_est} is not recognised.")
+                    raise ValueError(f"Value estimator {args.value_est} is not recognised.")
                 next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
 
             qf1_a_values = qf1(data.observations, data.actions).view(-1)
@@ -443,17 +441,22 @@ if __name__ == "__main__":
             if global_step % 100 == 0:
                 sps = int(global_step / (time.time() - start_time))
                 print("SPS:", sps)
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/pi_ref_loss", pi_ref_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
-                writer.add_scalar("charts/SPS", sps, global_step)
-                if args.autotune:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                if args.track:
+                    log_dict = {
+                        "losses/qf1_values": qf1_a_values.mean().item(),
+                        "losses/qf2_values": qf2_a_values.mean().item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item() / 2.0,
+                        "losses/actor_loss": actor_loss.item(),
+                        "losses/pi_ref_loss": pi_ref_loss.item(),
+                        "losses/alpha": alpha,
+                        "charts/SPS": sps,
+                    }
+                    if args.autotune:
+                        log_dict["losses/alpha_loss"] = alpha_loss.item()
+                    # ONE network call instead of many disk calls
+                    wandb.log(log_dict, step=global_step)
             
             if(global_step % 10_000 == 0):
                 write_and_dump(writer=parquet_writer, run_data=run_data)
@@ -461,4 +464,3 @@ if __name__ == "__main__":
     write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()
-    writer.close()

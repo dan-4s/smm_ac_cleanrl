@@ -13,7 +13,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
 
@@ -187,17 +186,12 @@ if __name__ == "__main__":
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False, # Fuck tensorboard lmfao (accidental DDOS).
             config=vars(args),
             name=run_name,
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
 
     # For data logging.
     run_data = {
@@ -278,8 +272,11 @@ if __name__ == "__main__":
             for info in infos["final_info"]:
                 if info is not None:
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    if args.track:
+                        wandb.log({
+                            "charts/episodic_return": info["episode"]["r"],
+                            "charts/episodic_length": info["episode"]["l"],
+                        }, step=global_step)
                     run_data["episodic_return"].append(float(info["episode"]["r"][0]))
                     run_data["episodic_length"].append(int(info["episode"]["l"][0]))
                     run_data["episodic_step"].append(int(global_step))
@@ -311,7 +308,8 @@ if __name__ == "__main__":
                         qf2_next_target = qf2_target(data.next_observations, next_state_actions)
                         qs.append(torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi)
                     qs = torch.stack(qs).squeeze(0)
-                    min_qf_next_target = torch.mean(qs, dim=0)
+                    # Avoid the mean if single-sample estimator.
+                    min_qf_next_target = torch.mean(qs, dim=0) if(N > 1) else qs
                 elif(args.value_est == "empirical_expectation"):
                     qs = []
                     weights = []
@@ -375,26 +373,27 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
-                if args.autotune:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+                sps = int(global_step / (time.time() - start_time))
+                print(f"SPS: {sps}")
+                if args.track:
+                    log_dict = {
+                        "losses/qf1_values": qf1_a_values.mean().item(),
+                        "losses/qf2_values": qf2_a_values.mean().item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item() / 2.0,
+                        "losses/actor_loss": actor_loss.item(),
+                        "losses/alpha": alpha,
+                        "charts/SPS": sps,
+                    }
+                    if args.autotune:
+                        log_dict["losses/alpha_loss"] = alpha_loss.item()
+                    # ONE network call instead of many disk calls
+                    wandb.log(log_dict, step=global_step)
             
-            if(global_step % 5100 == 0):
+            if(global_step % 10_000 == 0):
                 write_and_dump(writer=parquet_writer, run_data=run_data)
 
     write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()
-    writer.close()

@@ -2,7 +2,7 @@
 #SBATCH --job-name=smm_extensive
 #SBATCH --output=logs/smm_%A_%a.out
 #SBATCH --error=logs/smm_%A_%a.err
-#SBATCH --array=0-29                 # (10 Repeats) - 1
+#SBATCH --array=0-9                 # (10 Repeats) - 1
 #SBATCH --time=11:00:00
 #SBATCH --mem=8G
 #SBATCH --cpus-per-task=1
@@ -10,11 +10,11 @@
 mkdir -p logs
 
 # Create the results directory if it doesn't exist
-RESULTS_DIR=results_january_23
+RESULTS_DIR=results_january_25_N_1
 mkdir -p $RESULTS_DIR
 
 # 1. Define parameter arrays
-num_val_est_samples=(1 2 5) # Length: 3
+num_val_est_samples=(1) # Length: 1
 NUM_REPEATS=10
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
@@ -31,6 +31,7 @@ RUN_NAME="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
 RESULTS_SUB_DIR="${ENV}__SAC_N=${N}"
 mkdir -p "$RESULTS_DIR/$RESULTS_SUB_DIR"
 
+sleep $((RANDOM % 20))  # Wait between 0 and 20 seconds, avoids network spikes.
 python cleanrl/sac_continuous_action.py \
     --no-torch_deterministic \
     --value_est="$VAL_EST" \
