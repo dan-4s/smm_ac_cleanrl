@@ -11,7 +11,7 @@ import pandas as pd
 import polars as pl
 
 # Constants
-PLOT_N = [2, 5]
+PLOT_N = [1, 2, 5]
 PLOT_LR = ["1e-6","5e-6", "1e-5", "5e-5"]
 PLOT_REF_FREQ = [2, 4, 6]
 BASELINES = ["SAC"]

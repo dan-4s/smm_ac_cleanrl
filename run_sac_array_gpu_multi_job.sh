@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=10         # 1 CPU per agent repeat
 #SBATCH --gres=gpu:1               # All 10 repeats share this 1 GPU
 #SBATCH --mem=32G                  # Increased memory for 10 agents
-#SBATCH --time=6:00:00
+#SBATCH --time=10:00:00
 
 mkdir -p logs
 
@@ -40,6 +40,7 @@ do
         --value_est="$VAL_EST" \
         --num_val_est_samples="$N" \
         --wandb_project_name="SMM-AC-$ENV" \
+        --wandb_group="${RESULTS_SUB_DIR}" \
         --wandb_run_name="${RESULTS_SUB_DIR}_seed${i_repeat}" \
         --output_filename="${RESULTS_DIR}/${RESULTS_SUB_DIR}/${RUN_ID}" &
     
