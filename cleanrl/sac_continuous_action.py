@@ -1,6 +1,8 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import os
 import random
+import signal
+import sys
 import time
 from dataclasses import dataclass
 
@@ -43,7 +45,7 @@ class Args:
     # Algorithm specific arguments
     value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
     """The value estimation method."""
-    num_val_est_samples: int = 5 
+    num_val_est_samples: int = 1
     """The number of samples collected for the value estimate, when empirical_expectation"""
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
@@ -73,6 +75,8 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
+    checkpoint_frequency: int = 50000
+    """how often to write checkpoints"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -180,12 +184,15 @@ if __name__ == "__main__":
 
     args = tyro.cli(Args)
     run_name = args.wandb_run_name
+    checkpoint_filename = args.output_filename + ".pt"
     if args.track:
         import wandb
-
+        wandb_id = os.path.basename(args.output_filename)
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
+            id=wandb_id, # Just the run_id, without the folder path.
+            resume="allow",
             sync_tensorboard=False, # Fuck tensorboard lmfao (accidental DDOS).
             config=vars(args),
             name=run_name,
@@ -204,9 +211,10 @@ if __name__ == "__main__":
         ("episodic_length", pa.int64()),   # List of ints
         ("episodic_step", pa.int64()),     # The global step
     ])
-    table = pa.Table.from_pydict(run_data)
-    output_filename = args.output_filename + ".parquet"
-    parquet_writer = pq.ParquetWriter(output_filename, schema)
+    # Use restart count to avoid overwriting previous attempt's data
+    restart_idx = os.getenv("SLURM_RESTART_COUNT", "0")
+    current_parquet_path = f"{args.output_filename}_restart{restart_idx}.parquet"
+    parquet_writer = pq.ParquetWriter(current_parquet_path, schema)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -243,6 +251,47 @@ if __name__ == "__main__":
     else:
         alpha = args.alpha
 
+    # Pre-emption recovery: register termination and time-out signals.
+    start_step = 0
+    if(os.path.exists(checkpoint_filename)):
+        print(f"Resuming from checkpoint: {checkpoint_filename}")
+        map_location = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        ckpt = torch.load(checkpoint_filename, map_location=map_location)
+        actor.load_state_dict(ckpt['actor_state_dict'])
+        qf1.load_state_dict(ckpt['qf1_state_dict'])
+        qf2.load_state_dict(ckpt['qf2_state_dict'])
+        q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
+        actor_optimizer.load_state_dict(ckpt['actor_optimizer_state_dict'])
+        if args.autotune:
+            log_alpha.data = ckpt['log_alpha']
+            a_optimizer.load_state_dict(ckpt['a_optimizer_state_dict'])
+        start_step = ckpt['global_step']
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+    
+    # Signal handler: Emergency Save
+    global_step = start_step
+    def save_checkpoint_and_exit(signum, frame):
+        print(f"\nSignal {signum} received. Saving and exiting...")
+        write_and_dump(parquet_writer, run_data)
+        parquet_writer.close()
+        ckpt = {
+            'global_step': global_step,
+            'actor_state_dict': actor.state_dict(),
+            'qf1_state_dict': qf1.state_dict(),
+            'qf2_state_dict': qf2.state_dict(),
+            'q_optimizer_state_dict': q_optimizer.state_dict(),
+            'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+            'log_alpha': log_alpha if args.autotune else None,
+            'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
+        }
+        torch.save(ckpt, checkpoint_filename)
+        sys.exit(0)
+
+
+    signal.signal(signal.SIGTERM, save_checkpoint_and_exit)
+    signal.signal(signal.SIGUSR1, save_checkpoint_and_exit)
+
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
         args.buffer_size,
@@ -256,7 +305,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    for global_step in range(start_step, args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -293,7 +342,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        if global_step > args.learning_starts and rb.size() > args.batch_size:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 if(args.value_est == "explicit_regulariser"):
@@ -393,7 +442,12 @@ if __name__ == "__main__":
             
             if(global_step % 10_000 == 0):
                 write_and_dump(writer=parquet_writer, run_data=run_data)
-
-    write_and_dump(writer=parquet_writer, run_data=run_data)
+    
+    # Unregister the signals to avoid double-write in case of kill at the end.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+    if(len(run_data["episodic_return"]) > 0):
+        # Ensure that writing doesn't occur unnecessarily or cause errors.
+        write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()

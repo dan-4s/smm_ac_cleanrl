@@ -1,4 +1,5 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/td3/#td3_continuous_actionpy
+# File modified for SMM-AC experiments.
 import os
 import random
 import time
@@ -6,48 +7,45 @@ from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tyro
-from torch.utils.tensorboard import SummaryWriter
 
 from cleanrl_utils.buffers import ReplayBuffer
 
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    wandb_run_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    output_filename: str = "test_results"
+    "the name of the results file where we store run data"
+    seed: int = int.from_bytes(os.urandom(4), "little")
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "SMM-AC"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "gauthier-gidel"
     """the entity (team) of wandb's project"""
+    wandb_group: str = "TD3"
+    """The group of an individual run, indexed by the algorithm and subcategories therein."""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
-    """the id of the environment"""
+    """the environment id of the task"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
     buffer_size: int = int(1e6)
@@ -58,14 +56,18 @@ class Args:
     """target smoothing coefficient (default: 0.005)"""
     batch_size: int = 256
     """the batch size of sample from the reply memory"""
+    learning_starts: int = 25e3
+    """timestep to start learning"""
+    policy_lr: float = 3e-4
+    """the learning rate of the policy network optimizer"""
+    q_lr: float = 3e-4
+    """the learning rate of the Q network network optimizer"""
+    policy_frequency: int = 2
+    """the frequency of training policy (delayed)"""
     policy_noise: float = 0.2
     """the scale of policy noise"""
     exploration_noise: float = 0.1
     """the scale of exploration noise"""
-    learning_starts: int = 25e3
-    """timestep to start learning"""
-    policy_frequency: int = 2
-    """the frequency of training policy (delayed)"""
     noise_clip: float = 0.5
     """noise clip parameter of the Target Policy Smoothing Regularization"""
 
@@ -80,8 +82,15 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env.action_space.seed(seed)
         return env
-
     return thunk
+
+
+def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
+    table = pa.Table.from_pydict(run_data)
+    writer.write_table(table)
+    # Clear the dictionary so RAM doesn't grow!
+    for key in run_data:
+        run_data[key] = []
 
 
 # ALGO LOGIC: initialize agent here:
@@ -133,28 +142,33 @@ class Actor(nn.Module):
 
 
 if __name__ == "__main__":
-
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    run_name = args.wandb_run_name
+    
     if args.track:
         import wandb
-
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            sync_tensorboard=False, # Avoid DDOSing the cluster.
+            group=args.wandb_group,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
 
-    # TRY NOT TO MODIFY: seeding
+    # Parquet Logging Setup
+    run_data = {"episodic_return": [], "episodic_length": [], "episodic_step": []}
+    schema = pa.schema([
+        ("episodic_return", pa.float64()),
+        ("episodic_length", pa.int64()),
+        ("episodic_step", pa.int64()),
+    ])
+    output_filename = args.output_filename + ".parquet"
+    parquet_writer = pq.ParquetWriter(output_filename, schema)
+
+    # Seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -162,12 +176,13 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    # env setup
+    # Env setup
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
+    
     actor = Actor(envs).to(device)
     qf1 = QNetwork(envs).to(device)
     qf2 = QNetwork(envs).to(device)
@@ -177,8 +192,8 @@ if __name__ == "__main__":
     target_actor.load_state_dict(actor.state_dict())
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.learning_rate)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.learning_rate)
+    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -211,8 +226,14 @@ if __name__ == "__main__":
             for info in infos["final_info"]:
                 if info is not None:
                     print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                    writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                    writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                    if args.track:
+                        wandb.log({
+                            "charts/episodic_return": info["episode"]["r"],
+                            "charts/episodic_length": info["episode"]["l"],
+                        }, step=global_step)
+                    run_data["episodic_return"].append(float(info["episode"]["r"][0]))
+                    run_data["episodic_length"].append(int(info["episode"]["l"][0]))
+                    run_data["episodic_step"].append(int(global_step))
                     break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -247,7 +268,7 @@ if __name__ == "__main__":
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
 
-            # optimize the model
+            # optimise the model.
             q_optimizer.zero_grad()
             qf_loss.backward()
             q_optimizer.step()
@@ -267,51 +288,22 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar(
-                    "charts/SPS",
-                    int(global_step / (time.time() - start_time)),
-                    global_step,
-                )
+                sps = int(global_step / (time.time() - start_time))
+                print(f"SPS: {sps}")
+                if args.track:
+                    wandb.log({
+                        "losses/qf1_values": qf1_a_values.mean().item(),
+                        "losses/qf2_values": qf2_a_values.mean().item(),
+                        "losses/qf1_loss": qf1_loss.item(),
+                        "losses/qf2_loss": qf2_loss.item(),
+                        "losses/qf_loss": qf_loss.item() / 2.0,
+                        "losses/actor_loss": actor_loss.item(),
+                        "charts/SPS": sps,
+                    }, step=global_step)
+            
+            if global_step % 10_000 == 0:
+                write_and_dump(writer=parquet_writer, run_data=run_data)
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save((actor.state_dict(), qf1.state_dict(), qf2.state_dict()), model_path)
-        print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.td3_eval import evaluate
-
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=(Actor, QNetwork),
-            device=device,
-            exploration_noise=args.exploration_noise,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
-
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
-
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(
-                args,
-                episodic_returns,
-                repo_id,
-                "TD3",
-                f"runs/{run_name}",
-                f"videos/{run_name}-eval",
-            )
-
+    write_and_dump(writer=parquet_writer, run_data=run_data)
+    parquet_writer.close()
     envs.close()
-    writer.close()

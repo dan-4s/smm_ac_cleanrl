@@ -43,7 +43,7 @@ class Args:
     # Algorithm specific arguments
     value_est: str = "explicit_regulariser" # Can also be "empirical_expectation"
     """The value estimation method for SMM."""
-    num_val_est_samples: int = 5 
+    num_val_est_samples: int = 1
     """The number of samples collected for the value estimate, when empirical_expectation"""
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
