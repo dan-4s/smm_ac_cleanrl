@@ -1,49 +1,50 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
 import os
 import random
+import signal
+import sys
 import time
 from dataclasses import dataclass
 
 import gymnasium as gym
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import tyro
 from torch.distributions.normal import Normal
-from torch.utils.tensorboard import SummaryWriter
+
+from smm_ac_utils.shared_functions import get_steps_per_env, write_and_dump
 
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    wandb_run_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
-    seed: int = 1
+    output_filename: str = "test_results"
+    """the name of the results file where we store run data"""
+    seed: int = int.from_bytes(os.urandom(4), "little")
     """seed of the experiment"""
     torch_deterministic: bool = True
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = False
+    track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    wandb_project_name: str = "cleanRL"
+    wandb_project_name: str = "SMM-AC"
     """the wandb's project name"""
-    wandb_entity: str = None
+    wandb_entity: str = "gauthier-gidel"
     """the entity (team) of wandb's project"""
+    wandb_group: str = "PPO"
+    """The group of an individual run, indexed by the algorithm and subcategories therein."""
     capture_video: bool = False
     """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
-    upload_model: bool = False
-    """whether to upload the saved model to huggingface"""
-    hf_entity: str = ""
-    """the user or org name of the model repository from the Hugging Face Hub"""
 
     # Algorithm specific arguments
     env_id: str = "HalfCheetah-v4"
     """the id of the environment"""
-    total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
@@ -145,25 +146,39 @@ if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    args.num_iterations = get_steps_per_env(args.env_id) // args.batch_size
+    run_name = args.wandb_run_name
+    checkpoint_filename = args.output_filename + ".pt"
     if args.track:
         import wandb
-
+        wandb_id = os.path.basename(args.output_filename)
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
-            sync_tensorboard=True,
+            id=wandb_id, # Just the run_id, without the folder path.
+            resume="allow",
+            sync_tensorboard=False, # Avoid DDOSing the cluster.
+            group=args.wandb_group,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
             save_code=True,
         )
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
+
+    # For data logging.
+    run_data = {
+        "episodic_return": [],
+        "episodic_length": [],
+        "episodic_step": [],
+    }
+    schema = pa.schema([
+        ("episodic_return", pa.float64()), # List of floats
+        ("episodic_length", pa.int64()),   # List of ints
+        ("episodic_step", pa.int64()),     # The global step
+    ])
+    restart_idx = os.getenv("SLURM_RESTART_COUNT", "0")
+    current_parquet_path = f"{args.output_filename}_restart{restart_idx}.parquet"
+    parquet_writer = pq.ParquetWriter(current_parquet_path, schema)
 
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
@@ -182,6 +197,40 @@ if __name__ == "__main__":
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # --- Resuming Logic ---
+    start_iteration = 1
+    update = start_iteration
+    start_step = 0
+    
+    if os.path.exists(checkpoint_filename):
+        print(f"Resuming from checkpoint: {checkpoint_filename}")
+        ckpt = torch.load(checkpoint_filename)
+        agent.load_state_dict(ckpt['agent_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        # Resume iteration count
+        start_iteration = ckpt['iteration'] + 1
+        start_step = ckpt['global_step'] + 1
+        print(f"Resuming at iteration {start_iteration}, global_step {start_step}")
+    global_step = start_step
+
+    # --- Slurm Signal Handler ---
+    def save_checkpoint_and_exit(signum, frame):
+        print(f"\nSignal {signum} received. Saving and exiting...")
+        write_and_dump(writer=parquet_writer, run_data=run_data)
+        parquet_writer.close()
+        ckpt = {
+            'iteration': update,
+            'global_step': global_step,
+            'agent_state_dict': agent.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+        }
+        torch.save(ckpt, checkpoint_filename)
+        print(f"Checkpoint saved to {checkpoint_filename}")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, save_checkpoint_and_exit)
+    signal.signal(signal.SIGUSR1, save_checkpoint_and_exit)
+
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
@@ -191,16 +240,16 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
     start_time = time.time()
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
 
-    for iteration in range(1, args.num_iterations + 1):
+    # Loop modified to support resuming
+    for update in range(start_iteration, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
-            frac = 1.0 - (iteration - 1.0) / args.num_iterations
+            frac = 1.0 - (update - 1.0) / args.num_iterations
             lrnow = frac * args.learning_rate
             optimizer.param_groups[0]["lr"] = lrnow
 
@@ -226,8 +275,14 @@ if __name__ == "__main__":
                 for info in infos["final_info"]:
                     if info and "episode" in info:
                         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
-                        writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
-                        writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        if args.track:
+                            wandb.log({
+                                "charts/episodic_return": info["episode"]["r"],
+                                "charts/episodic_length": info["episode"]["l"],
+                            }, step=global_step)
+                        run_data["episodic_return"].append(float(info["episode"]["r"][0]))
+                        run_data["episodic_length"].append(int(info["episode"]["l"][0]))
+                        run_data["episodic_step"].append(int(global_step))
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -312,42 +367,40 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
-        writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
-        writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
-        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+        sps = int((global_step - start_step) / (time.time() - start_time))
+        print("SPS:", sps)
+        if args.track:
+            log_dict = {
+                "losses/learning_rate": optimizer.param_groups[0]["lr"],
+                "losses/value_loss": v_loss.item(),
+                "losses/policy_loss": pg_loss.item(),
+                "losses/entropy": entropy_loss.item(),
+                "losses/old_approx_kl": old_approx_kl.item(),
+                "losses/approx_kl": approx_kl.item(),
+                "losses/clipfrac": np.mean(clipfracs),
+                "losses/explained_variance": explained_var,
+                "charts/SPS": sps,
+            }
+            wandb.log(log_dict, step=global_step)
 
-    if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-        torch.save(agent.state_dict(), model_path)
-        print(f"model saved to {model_path}")
-        from cleanrl_utils.evals.ppo_eval import evaluate
+        if update % 10 == 0:  # Adjust frequency as needed
+            write_and_dump(writer=parquet_writer, run_data=run_data)
 
-        episodic_returns = evaluate(
-            model_path,
-            make_env,
-            args.env_id,
-            eval_episodes=10,
-            run_name=f"{run_name}-eval",
-            Model=Agent,
-            device=device,
-            gamma=args.gamma,
-        )
-        for idx, episodic_return in enumerate(episodic_returns):
-            writer.add_scalar("eval/episodic_return", episodic_return, idx)
 
-        if args.upload_model:
-            from cleanrl_utils.huggingface import push_to_hub
+    # Unregister the signals to avoid double-write in case of kill at the end.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGUSR1, signal.SIG_DFL)
 
-            repo_name = f"{args.env_id}-{args.exp_name}-seed{args.seed}"
-            repo_id = f"{args.hf_entity}/{repo_name}" if args.hf_entity else repo_name
-            push_to_hub(args, episodic_returns, repo_id, "PPO", f"runs/{run_name}", f"videos/{run_name}-eval")
+    # Save a checkpoint:
+    ckpt = {
+        'iteration': update, # Capture current loop variable
+        'global_step': global_step,
+        'agent_state_dict': agent.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    torch.save(ckpt, checkpoint_filename)
 
+    # Dump data and close parquet writer.
+    write_and_dump(writer=parquet_writer, run_data=run_data)
+    parquet_writer.close()
     envs.close()
-    writer.close()

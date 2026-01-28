@@ -235,8 +235,6 @@ if __name__ == "__main__":
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
-    max_action = float(envs.single_action_space.high[0])
-
     actor = Actor(envs).to(device)
     pi_ref = Actor(envs).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -294,6 +292,7 @@ if __name__ == "__main__":
             'pi_ref_optimizer_state_dict': pi_ref_optimizer.state_dict(),
         }
         torch.save(ckpt, checkpoint_filename)
+        print(f"Checkpoint saved to {checkpoint_filename}")
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, save_checkpoint_and_exit)
@@ -478,7 +477,7 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                sps = int(global_step / (time.time() - start_time))
+                sps = int((global_step - start_step) / (time.time() - start_time))
                 print("SPS:", sps)
                 if args.track:
                     log_dict = {
@@ -519,6 +518,7 @@ if __name__ == "__main__":
     }
     torch.save(ckpt, checkpoint_filename)
 
+    # Dump data and close parquet writer.
     write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()

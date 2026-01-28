@@ -330,7 +330,7 @@ if __name__ == "__main__":
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
             if global_step % 100 == 0:
-                sps = int(global_step / (time.time() - start_time))
+                sps = int((global_step - start_step) / (time.time() - start_time))
                 print(f"SPS: {sps}")
                 if args.track:
                     wandb.log({
