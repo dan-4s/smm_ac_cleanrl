@@ -75,8 +75,6 @@ class Args:
     """Entropy regularization coefficient."""
     autotune: bool = True
     """automatic tuning of the entropy coefficient"""
-    checkpoint_frequency: int = 50000
-    """how often to write checkpoints"""
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -94,12 +92,14 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
-    table = pa.Table.from_pydict(run_data)
-    writer.write_table(table)
-
-    # Clear the dictionary so RAM doesn't grow!
-    for key in run_data:
-        run_data[key] = []
+    # Only write if there is actually data to avoid schema errors
+    if len(run_data["episodic_return"]) > 0:
+        table = pa.Table.from_pydict(run_data)
+        writer.write_table(table)
+        
+        # Clear the dictionary so RAM doesn't grow!
+        for key in run_data:
+            run_data[key] = []
 
 
 # ALGO LOGIC: initialize agent here:
@@ -193,7 +193,8 @@ if __name__ == "__main__":
             entity=args.wandb_entity,
             id=wandb_id, # Just the run_id, without the folder path.
             resume="allow",
-            sync_tensorboard=False, # Fuck tensorboard lmfao (accidental DDOS).
+            sync_tensorboard=False, # Avoid DDOSing the cluster.
+            group=args.wandb_group,
             config=vars(args),
             name=run_name,
             monitor_gym=True,
@@ -229,8 +230,6 @@ if __name__ == "__main__":
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-
-    max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
     qf1 = SoftQNetwork(envs).to(device)
@@ -446,8 +445,21 @@ if __name__ == "__main__":
     # Unregister the signals to avoid double-write in case of kill at the end.
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
     signal.signal(signal.SIGUSR1, signal.SIG_DFL)
-    if(len(run_data["episodic_return"]) > 0):
-        # Ensure that writing doesn't occur unnecessarily or cause errors.
-        write_and_dump(writer=parquet_writer, run_data=run_data)
+
+    # Save a checkpoint:
+    ckpt = {
+        'global_step': global_step,
+        'actor_state_dict': actor.state_dict(),
+        'qf1_state_dict': qf1.state_dict(),
+        'qf2_state_dict': qf2.state_dict(),
+        'q_optimizer_state_dict': q_optimizer.state_dict(),
+        'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+        'log_alpha': log_alpha if args.autotune else None,
+        'a_optimizer_state_dict': a_optimizer.state_dict() if args.autotune else None,
+    }
+    torch.save(ckpt, checkpoint_filename)
+
+    # Dump to parquet, and close the writer.
+    write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()
