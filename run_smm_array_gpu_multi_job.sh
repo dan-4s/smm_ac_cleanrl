@@ -5,17 +5,44 @@
 #SBATCH --array=0-11               # FIXED: 4 LRs * 3 Freqs = 12 combinations
 #SBATCH --time=15:00:00
 #SBATCH --mem=32G                  # INCREASED: To support 10 parallel processes
-#SBATCH --cpus-per-task=10         # FIXED: Requesting 10 CPUs (1 per background process)
+#SBATCH --cpus-per-task=5          # FIXED: Requesting 10 CPUs (1 per background process)
 #SBATCH --gres=gpu:1               # Request 1 GPU for all 10 processes to share
+#SBATCH --requeue                  # <--- 1. Tell Slurm to allow requeuing
+#SBATCH --signal=B:SIGUSR1@120     # <--- 2. Send SIGUSR1 120 seconds before time limit
 
+# 0. Define the cleanup/resubmission handler
+cleanup_handler() {
+    echo "Preemption or Timeout signal received at $(date)"
+    
+    # Kill all child processes (the python runs)
+    # This triggers the internal python signal handlers to save checkpoints
+    trap - SIGTERM # prevent recursion
+    child_pids=$(jobs -p)
+    if [ -n "$child_pids" ]; then
+        echo "Stopping child processes: $child_pids"
+        kill -SIGTERM $child_pids
+        wait $child_pids
+    fi
+
+    echo "Requeuing job $SLURM_ARRAY_JOB_ID index $SLURM_ARRAY_TASK_ID"
+    scontrol requeue $SLURM_JOB_ID
+    exit 0
+}
+
+# Register the handler for both SIGUSR1 (timeout) and SIGTERM (preemption)
+trap 'cleanup_handler' SIGUSR1 SIGTERM
+
+# Create logs directory
 mkdir -p logs
-RESULTS_DIR=results_january_27_N_1
+
+# Create the results directory
+RESULTS_DIR=results_january_28_smm_multi_run
 mkdir -p $RESULTS_DIR
 
 # 1. Define parameter arrays
 pi_ref_learning_rates=(1e-6 5e-6 1e-5 5e-5) # Length: 4
 pi_ref_freq=(2 4 6)                         # Length: 3
-NUM_REPEATS=10
+NUM_REPEATS=5
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
 # Think of this like nested loops: LR -> Freq -> N -> Repeat
@@ -45,11 +72,12 @@ mkdir -p "${RESULTS_DIR}/${RESULTS_SUB_DIR}"
 
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))
 do
-   # We use a unique RUN_NAME per repeat for file tracking
-   RUN_NAME="${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}_r${i_repeat}"
+   # Unique identifier for each repeat
+   RUN_ID="${RESULTS_SUB_DIR}_r${i_repeat}"
    
    # Launch in background with '&'
    python cleanrl/smm_ac_continuous_action.py \
+        --env_id="$ENV" \
         --value_est="$SMM_VAL" \
         --num_val_est_samples="$N" \
         --wandb_project_name="SMM-AC-$ENV" \
@@ -59,11 +87,16 @@ do
         --alpha="$ALPHA" \
         --omega="$OMEGA" \
         --pi_ref_lr="$PI_REF_LR" \
-        --output_filename="${RESULTS_DIR}/${RESULTS_SUB_DIR}/${RUN_NAME}" &
+        --output_filename="${RESULTS_DIR}/${RESULTS_SUB_DIR}/${RUN_ID}" &
    
    sleep 2 # Small stagger to prevent W&B login/file-lock spikes
 done
 
-# 5. Wait for all 10 background processes to finish
-wait
+# 4. Wait for background tasks
+# We use a loop to wait so the script stays alive to catch signals
+while pgrep -P $$ > /dev/null; do 
+    sleep 5
+done
+echo "All experiments completed."
+# ===================
 

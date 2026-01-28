@@ -13,7 +13,7 @@ import parse
 import polars as pl
 
 # Constants
-BASELINES = ["SAC"]
+BASELINES = ["SAC", "TD3"]
 TASKS = ["Hopper-v4", "Hopper-v4"] # ["Ant-v4", "Hopper-v4"] # The ant results are corrupted rn.
 
 

@@ -18,7 +18,7 @@ import torch.optim as optim
 import tyro
 
 from cleanrl_utils.buffers import ReplayBuffer
-
+from smm_ac_utils.shared_functions import get_steps_per_env, write_and_dump
 
 @dataclass
 class Args:
@@ -46,8 +46,6 @@ class Args:
     # Algorithm specific arguments
     env_id: str = "Hopper-v4"
     """the environment id of the task"""
-    total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
     num_envs: int = 1
     """the number of parallel game environments"""
     buffer_size: int = int(1e6)
@@ -85,17 +83,6 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env.action_space.seed(seed)
         return env
     return thunk
-
-
-def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
-    # Only write if there is actually data to avoid schema errors
-    if len(run_data["episodic_return"]) > 0:
-        table = pa.Table.from_pydict(run_data)
-        writer.write_table(table)
-
-        # Clear the dictionary so RAM doesn't grow!
-        for key in run_data:
-            run_data[key] = []
 
 
 # ALGO LOGIC: initialize agent here:
@@ -218,10 +205,10 @@ if __name__ == "__main__":
         qf2.load_state_dict(ckpt['qf2_state_dict'])
         q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
         actor_optimizer.load_state_dict(ckpt['actor_optimizer_state_dict'])
-        start_step = ckpt['global_step']
-        qf1_target.load_state_dict(qf1.state_dict())
-        qf2_target.load_state_dict(qf2.state_dict())
-        target_actor.load_state_dict(actor.state_dict())
+        start_step = ckpt['global_step'] + 1
+        qf1_target.load_state_dict(ckpt['qf1_target_state_dict'])
+        qf2_target.load_state_dict(ckpt['qf2_target_state_dict'])
+        target_actor.load_state_dict(ckpt['target_actor_state_dict'])
 
     # Signal handler
     global_step = start_step
@@ -232,8 +219,11 @@ if __name__ == "__main__":
         ckpt = {
             'global_step': global_step,
             'actor_state_dict': actor.state_dict(),
+            'target_actor_state_dict': target_actor.state_dict(),
             'qf1_state_dict': qf1.state_dict(),
+            'qf1_target_state_dict': qf1_target.state_dict(),
             'qf2_state_dict': qf2.state_dict(),
+            'qf2_target_state_dict': qf2_target.state_dict(),
             'q_optimizer_state_dict': q_optimizer.state_dict(),
             'actor_optimizer_state_dict': actor_optimizer.state_dict(),
         }
@@ -256,11 +246,15 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(start_step, args.total_timesteps):
+    total_timesteps = get_steps_per_env(args.env_id)
+    effective_learning_starts = args.learning_starts if start_step == 0 else (start_step + 1000)
+    for global_step in range(start_step, total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
+            # Always sample directly from agent if we're past the
+            # learning_starts mark! The data will be better!
             with torch.no_grad():
                 actions = actor(torch.Tensor(obs).to(device))
                 actions += torch.normal(0, actor.action_scale * args.exploration_noise)
@@ -295,7 +289,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts and rb.size() > args.batch_size:
+        if global_step > effective_learning_starts and rb.size() > args.batch_size:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 clipped_noise = (torch.randn_like(data.actions, device=device) * args.policy_noise).clamp(
@@ -360,8 +354,11 @@ if __name__ == "__main__":
     ckpt = {
         'global_step': global_step,
         'actor_state_dict': actor.state_dict(),
+        'target_actor_state_dict': target_actor.state_dict(),
         'qf1_state_dict': qf1.state_dict(),
+        'qf1_target_state_dict': qf1_target.state_dict(),
         'qf2_state_dict': qf2.state_dict(),
+        'qf2_target_state_dict': qf2_target.state_dict(),
         'q_optimizer_state_dict': q_optimizer.state_dict(),
         'actor_optimizer_state_dict': actor_optimizer.state_dict(),
     }

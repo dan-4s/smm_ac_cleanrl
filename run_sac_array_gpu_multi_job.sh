@@ -9,7 +9,7 @@
 #SBATCH --time=15:00:00
 #SBATCH --requeue                  # <--- 1. Tell Slurm to allow requeuing
 #SBATCH --signal=B:SIGUSR1@120     # <--- 2. Send SIGUSR1 120 seconds before time limit
-#SBATCH --array=0-4
+#SBATCH --array=0-6
 
 # 0. Define the cleanup/resubmission handler
 cleanup_handler() {
@@ -37,14 +37,13 @@ trap 'cleanup_handler' SIGUSR1 SIGTERM
 mkdir -p logs
 
 # Create the results directory if it doesn't exist.
-RESULTS_DIR=results_january_27_sac_multi_run
+RESULTS_DIR=results_january_28_sac_multi_run
 mkdir -p $RESULTS_DIR
 
 # 1. Configuration
 N=1
 NUM_REPEATS=5 # 10 seems to choke the GPU, we'll see what 5 does.
-ENV_LIST=("HalfCheetah-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
-# ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
+ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
 ENV=${ENV_LIST[$SLURM_ARRAY_TASK_ID]}
 VAL_EST="explicit_regulariser" # empirical_expectation OR explicit_regulariser
 RESULTS_SUB_DIR="${ENV}__SAC_N=${N}"
@@ -61,10 +60,11 @@ echo "Launching $NUM_REPEATS repeats of $ENV in parallel on 1 GPU..."
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))
 do
     # Unique identifier for each repeat
-    RUN_ID="${ENV}_r${i_repeat}"
+    RUN_ID="${RESULTS_SUB_DIR}_r${i_repeat}"
     
     # Launch in background (&)
     python cleanrl/sac_continuous_action.py \
+        --env_id="$ENV" \
         --value_est="$VAL_EST" \
         --num_val_est_samples="$N" \
         --wandb_project_name="SMM-AC-$ENV" \
