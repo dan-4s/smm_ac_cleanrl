@@ -2,6 +2,8 @@
 # File modified for SMM-AC experiments.
 import os
 import random
+import signal
+import sys
 import time
 from dataclasses import dataclass
 
@@ -86,11 +88,14 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
 
 def write_and_dump(writer: pq.ParquetWriter, run_data: dict):
-    table = pa.Table.from_pydict(run_data)
-    writer.write_table(table)
-    # Clear the dictionary so RAM doesn't grow!
-    for key in run_data:
-        run_data[key] = []
+    # Only write if there is actually data to avoid schema errors
+    if len(run_data["episodic_return"]) > 0:
+        table = pa.Table.from_pydict(run_data)
+        writer.write_table(table)
+
+        # Clear the dictionary so RAM doesn't grow!
+        for key in run_data:
+            run_data[key] = []
 
 
 # ALGO LOGIC: initialize agent here:
@@ -144,12 +149,15 @@ class Actor(nn.Module):
 if __name__ == "__main__":
     args = tyro.cli(Args)
     run_name = args.wandb_run_name
-    
+    checkpoint_filename = args.output_filename + ".pt"
     if args.track:
         import wandb
+        wandb_id = os.path.basename(args.output_filename)
         wandb.init(
             project=args.wandb_project_name,
             entity=args.wandb_entity,
+            id=wandb_id, # Just the run_id, without the folder path.
+            resume="allow",
             sync_tensorboard=False, # Avoid DDOSing the cluster.
             group=args.wandb_group,
             config=vars(args),
@@ -159,16 +167,22 @@ if __name__ == "__main__":
         )
 
     # Parquet Logging Setup
-    run_data = {"episodic_return": [], "episodic_length": [], "episodic_step": []}
+    run_data = {
+        "episodic_return": [],
+        "episodic_length": [],
+        "episodic_step": [],
+    }
     schema = pa.schema([
         ("episodic_return", pa.float64()),
         ("episodic_length", pa.int64()),
         ("episodic_step", pa.int64()),
     ])
-    output_filename = args.output_filename + ".parquet"
-    parquet_writer = pq.ParquetWriter(output_filename, schema)
+    restart_idx = os.getenv("SLURM_RESTART_COUNT", "0")
+    current_parquet_path = f"{args.output_filename}_restart{restart_idx}.parquet"
+    parquet_writer = pq.ParquetWriter(current_parquet_path, schema)
 
-    # Seeding
+
+    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -181,7 +195,6 @@ if __name__ == "__main__":
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
-
     
     actor = Actor(envs).to(device)
     qf1 = QNetwork(envs).to(device)
@@ -194,6 +207,41 @@ if __name__ == "__main__":
     qf2_target.load_state_dict(qf2.state_dict())
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+
+    # Pre-emption recovery: register termination and time-out signals.
+    start_step = 0
+    if os.path.exists(checkpoint_filename):
+        print(f"Resuming from checkpoint: {checkpoint_filename}")
+        ckpt = torch.load(checkpoint_filename, map_location=device)
+        actor.load_state_dict(ckpt['actor_state_dict'])
+        qf1.load_state_dict(ckpt['qf1_state_dict'])
+        qf2.load_state_dict(ckpt['qf2_state_dict'])
+        q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
+        actor_optimizer.load_state_dict(ckpt['actor_optimizer_state_dict'])
+        start_step = ckpt['global_step']
+        qf1_target.load_state_dict(qf1.state_dict())
+        qf2_target.load_state_dict(qf2.state_dict())
+        target_actor.load_state_dict(actor.state_dict())
+
+    # Signal handler
+    global_step = start_step
+    def save_checkpoint_and_exit(signum, frame):
+        print(f"\nSignal {signum} received. Saving and exiting...")
+        write_and_dump(parquet_writer, run_data)
+        parquet_writer.close()
+        ckpt = {
+            'global_step': global_step,
+            'actor_state_dict': actor.state_dict(),
+            'qf1_state_dict': qf1.state_dict(),
+            'qf2_state_dict': qf2.state_dict(),
+            'q_optimizer_state_dict': q_optimizer.state_dict(),
+            'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+        }
+        torch.save(ckpt, checkpoint_filename)
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, save_checkpoint_and_exit)
+    signal.signal(signal.SIGUSR1, save_checkpoint_and_exit)
 
     envs.single_observation_space.dtype = np.float32
     rb = ReplayBuffer(
@@ -208,7 +256,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    for global_step in range(args.total_timesteps):
+    for global_step in range(start_step, args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -247,7 +295,7 @@ if __name__ == "__main__":
         obs = next_obs
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        if global_step > args.learning_starts and rb.size() > args.batch_size:
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 clipped_noise = (torch.randn_like(data.actions, device=device) * args.policy_noise).clamp(
@@ -304,6 +352,22 @@ if __name__ == "__main__":
             if global_step % 10_000 == 0:
                 write_and_dump(writer=parquet_writer, run_data=run_data)
 
+    # Unregister the signals to avoid double-write in case of kill at the end.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+
+    # Save a checkpoint:
+    ckpt = {
+        'global_step': global_step,
+        'actor_state_dict': actor.state_dict(),
+        'qf1_state_dict': qf1.state_dict(),
+        'qf2_state_dict': qf2.state_dict(),
+        'q_optimizer_state_dict': q_optimizer.state_dict(),
+        'actor_optimizer_state_dict': actor_optimizer.state_dict(),
+    }
+    torch.save(ckpt, checkpoint_filename)
+
+    # Dump to parquet, and close the writer.
     write_and_dump(writer=parquet_writer, run_data=run_data)
     parquet_writer.close()
     envs.close()
