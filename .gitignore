@@ -131,3 +131,7 @@ venv.bak/
 .mypy_cache/
 
 logs/*
+results*/*.parquet
+*.parquet
+*.png
+*.pt
