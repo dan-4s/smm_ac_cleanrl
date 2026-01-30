@@ -13,9 +13,11 @@ import parse
 import polars as pl
 
 # Constants
-BASELINES = ["SAC", "TD3"]
-TASKS = ["Hopper-v4", "Hopper-v4"] # ["Ant-v4", "Hopper-v4"] # The ant results are corrupted rn.
-
+BASELINES = ["SAC", "TD3", "PPO"]
+BASELINE_TO_MARKER = ["^", "o", ".", "o"]
+SMM_MARKER = "*"
+TASKS = ["Ant-v4", "HalfCheetah-v4", "Hopper-v4", "Pusher-v4", "Walker2d-v4"]
+# TASKS = ["Ant-v4", "HalfCheetah-v4", "Hopper-v4", "Humanoid-v4", "Pusher-v4", "Swimmer-v4", "Walker2d-v4"]
 
 def process_flat_parquet(file_pattern, grid_points=1000):
     # 1. Load data - No explode needed!
@@ -74,37 +76,77 @@ def plot_data(_):
     num_tasks = len(TASKS)
     num_cols = math.ceil(num_tasks / 2)
     num_rows = 2
-    fig, axs = plt.subplots(num_rows, num_cols, sharey=True)
+    fig, axs = plt.subplots(num_rows, num_cols, sharey=False)
     fig.set_size_inches(5*num_cols, 5*num_rows)
 
     # Plot for each task, at a position in the axis.
     for idx, task in enumerate(TASKS):
         x_idx = idx % num_cols
-        y_idx = idx // 2
+        y_idx = idx // num_cols
+        print((x_idx, y_idx, num_cols, num_tasks, task))
         # Assume we always have at least 2 tasks.
-        axis_idx = axs[x_idx, y_idx] if(num_tasks > 2) else axs[idx]
+        axis_idx = axs[y_idx, x_idx] if(num_tasks > 2) else axs[idx]
         # First, plot the baselines.
-        for baseline in BASELINES:
+        for base_idx, baseline in enumerate(BASELINES):
             common_grid, mean_line, _, std_line, _ = process_flat_parquet(
                 f"{folder}/{task}__{baseline}*/*.parquet")
-            axis_idx.plot(common_grid, mean_line, label=baseline, marker="^", markevery=50)
-            # axis_idx.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
+            axis_idx.plot(
+                common_grid,
+                mean_line,
+                label=baseline,
+                marker=BASELINE_TO_MARKER[base_idx],
+                markevery=50,
+            )
+            axis_idx.fill_between(
+                common_grid,
+                mean_line-std_line,
+                mean_line+std_line,
+                alpha=0.2,
+            )
         
         # Then, plot all the relevant results by searching for all results.
         for result_folder in glob.glob(f"{folder}/{task}__SMM*"):
-            parse_template = "final_results/{env}__SMM_lr={lr}_ref_freq={freq}_N={n}"
+            parse_template = "final_results/{env}__SMM_lr={lr}_ref_freq={freq}"
             SMM_hyperparams = parse.parse(parse_template, result_folder)
-            lr, ref_freq, N = SMM_hyperparams["lr"], SMM_hyperparams["freq"], SMM_hyperparams["n"]
+            lr, ref_freq = SMM_hyperparams["lr"], SMM_hyperparams["freq"]
             common_grid, mean_line, _, std_line, _ = process_flat_parquet(
                 f"{result_folder}/*.parquet")
-            axis_idx.plot(common_grid, mean_line, label=f"SMM_lr={lr}_ref_freq={ref_freq}")
-            # axis_idx.fill_between(common_grid, mean_line-std_line, mean_line+std_line, alpha=0.2)
+            axis_idx.plot(
+                common_grid,
+                mean_line,
+                label=f"SMM",
+                marker=SMM_MARKER,
+                markevery=50,
+            ) # Since we'll just plot the best SMM result.
+            # axis_idx.plot(common_grid, mean_line, label=f"SMM_lr={lr}_ref_freq={ref_freq}")
+            axis_idx.fill_between(
+                common_grid,
+                mean_line-std_line,
+                mean_line+std_line,
+                alpha=0.2,
+            )
     
-        axis_idx.set_title(f"SMM-AC vs. SAC on {task}")
+        axis_idx.set_title(f"SMM-AC vs. baselines on {task}")
         axis_idx.set_xlabel("Steps")
         axis_idx.set_ylabel("Average episodic return")
         axis_idx.grid()
-    axis_idx.legend(bbox_to_anchor=(1.05, 1)) # Use the last axis to put the legend.
+    
+    # If there are an odd number of tasks, put the legend in the last subplot, else, put it to the side.
+    if(num_tasks % 2 != 0):
+        legend_ax = axs[1, -1]
+
+        # Clear the target subplot and turn off its axes.
+        legend_ax.clear()
+        legend_ax.set_axis_off()
+
+        # Manually create legend handles (patches or lines) for all plots.
+        # This is necessary because the legend is being created in an empty axis
+        handles, labels = axis_idx.get_legend_handles_labels()
+
+        # 5. Add the combined legend to the target subplot
+        legend_ax.legend(handles=handles, labels=labels, loc='center', fancybox=True, shadow=True, ncol=1)
+    else:
+        axis_idx.legend(bbox_to_anchor=(1.05, 1)) # Use the last axis to put the legend.
     fig.savefig(f"{folder}/plots/combined_mujoco_results.png", bbox_inches='tight')
     plt.close()
     

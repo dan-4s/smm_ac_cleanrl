@@ -2,8 +2,8 @@
 #SBATCH --job-name=smm_parallel
 #SBATCH --output=logs/smm_%A_%a.out
 #SBATCH --error=logs/smm_%A_%a.err
-#SBATCH --array=0-83               # FIXED: 4 LRs * 3 Freqs = 12 * 7 = 84 combinations
-#SBATCH --time=15:00:00
+#SBATCH --array=0-20               # FIXED: 4 LRs * 3 Freqs = 12 * 7 = 84 combinations
+#SBATCH --time=40:00:00
 #SBATCH --mem=32G                  # INCREASED: To support 10 parallel processes
 #SBATCH --cpus-per-task=5          # FIXED: Requesting 10 CPUs (1 per background process)
 #SBATCH --gres=gpu:1               # Request 1 GPU for all 10 processes to share
@@ -36,29 +36,31 @@ trap 'cleanup_handler' SIGUSR1 SIGTERM
 mkdir -p logs
 
 # Create the results directory
-RESULTS_DIR=results_january_28_smm_multi_run
+RESULTS_DIR=results_january_30_smm_multi_run
 mkdir -p $RESULTS_DIR
 
 # 1. Define parameter arrays
-pi_ref_learning_rates=(1e-6 5e-6 1e-5 5e-5) # Length: 4
+# pi_ref_learning_rates=(1e-6 5e-6 1e-5 5e-5) # Length: 4
 pi_ref_freq=(2 4 6)                         # Length: 3
 ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
 # Think of this like nested loops: LR -> Freq -> N -> Repeat
 i_freq=$(( SLURM_ARRAY_TASK_ID % 3 ))
-i_lr=$(( (SLURM_ARRAY_TASK_ID / 3) % 4 ))
-i_env=$(( SLURM_ARRAY_TASK_ID / 12 ))
+# i_lr=$(( (SLURM_ARRAY_TASK_ID / 3) % 4 ))
+i_env=$(( SLURM_ARRAY_TASK_ID / 3 ))
+# i_env=$(( SLURM_ARRAY_TASK_ID / 12 ))
 
 # 3. Select values
 ENV=${ENV_LIST[$i_env]}
-PI_REF_LR=${pi_ref_learning_rates[$i_lr]}
+PI_REF_LR=1e-5
+# PI_REF_LR=${pi_ref_learning_rates[$i_lr]}
 REF_FREQ=${pi_ref_freq[$i_freq]}
 
 # Fixed values
 SMM_VAL="explicit_regulariser" # explicit_regulariser OR empirical_expectation
 ALPHA=1
-OMEGA=5
+OMEGA=20
 N=1
 NUM_REPEATS=5
 
@@ -69,7 +71,7 @@ export MKL_NUM_THREADS=1
 
 # 5. Execution
 echo "Task: $SLURM_ARRAY_TASK_ID | LR: $PI_REF_LR | Freq: $REF_FREQ | N: $N"
-RESULTS_SUB_DIR="${ENV}__SMM_lr=${PI_REF_LR}_ref_freq=${REF_FREQ}"
+RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_LRSCHED_ref_freq=${REF_FREQ}"
 mkdir -p "${RESULTS_DIR}/${RESULTS_SUB_DIR}"
 
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))

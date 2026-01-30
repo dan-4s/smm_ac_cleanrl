@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import tyro
 
 from cleanrl_utils.buffers import ReplayBuffer
@@ -195,6 +196,7 @@ if __name__ == "__main__":
         wandb_id = os.path.basename(args.output_filename)
         wandb.init(
             project=args.wandb_project_name,
+            # mode="offline", # TEMPORARY until I get back my wandb access...
             entity=args.wandb_entity,
             id=wandb_id, # Just the run_id, without the folder path.
             resume="allow",
@@ -248,13 +250,25 @@ if __name__ == "__main__":
     pi_ref_optimizer = optim.Adam(list(pi_ref.parameters()), lr=args.pi_ref_lr) # Want pi_ref to move very slowly!
 
     # Automatic entropy tuning
+    alpha = args.alpha
     if args.autotune:
-        target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
-        log_alpha = torch.zeros(1, requires_grad=True, device=device)
-        alpha = log_alpha.exp().item()
-        a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
+        # For SMM-AC we can only tune omega in the same way that SAC tunes
+        # their alpha. Our alpha is a choice about the minimum entropy we want
+        # a policy to have -> its minimum shape is like a softmax. As such, we
+        # will not explore learning our alpha for now.
+        target_KL = 0.05 # Like TRPO, PPO, etc., keep the divergence small.
+        
+        # Setting an inverse temperature of 5 is generally a good starting
+        # point.
+        log_lambda = torch.tensor([-1.6094], requires_grad=True, device=device)
+        omega = 1 / (log_lambda.exp().item())
+        lambda_optimizer = optim.Adam([log_lambda], lr=args.q_lr)
+
+        # target_entropy = -torch.prod(torch.Tensor(envs.single_action_space.shape).to(device)).item()
+        # log_alpha = torch.zeros(1, requires_grad=True, device=device)
+        # alpha = 1 / log_alpha.exp().item()
+        # a_optimizer = optim.Adam([log_alpha], lr=args.q_lr)
     else:
-        alpha = args.alpha
         omega = args.omega
 
     # Pre-emption recovery: register termination and time-out signals.
@@ -269,6 +283,9 @@ if __name__ == "__main__":
         q_optimizer.load_state_dict(ckpt['q_optimizer_state_dict'])
         actor_optimizer.load_state_dict(ckpt['actor_optimizer_state_dict'])
         pi_ref_optimizer.load_state_dict(ckpt['pi_ref_optimizer_state_dict'])
+        if args.autotune:
+            log_lambda.data = ckpt['log_lambda']
+            lambda_optimizer.load_state_dict(ckpt['lambda_optimizer_state_dict'])
         start_step = ckpt['global_step'] + 1
         qf1_target.load_state_dict(ckpt['qf1_target_state_dict'])
         qf2_target.load_state_dict(ckpt['qf2_target_state_dict'])
@@ -290,6 +307,8 @@ if __name__ == "__main__":
             'q_optimizer_state_dict': q_optimizer.state_dict(),
             'actor_optimizer_state_dict': actor_optimizer.state_dict(),
             'pi_ref_optimizer_state_dict': pi_ref_optimizer.state_dict(),
+            'log_lambda': log_lambda if args.autotune else None,
+            'lambda_optimizer_state_dict': lambda_optimizer.state_dict() if args.autotune else None,
         }
         torch.save(ckpt, checkpoint_filename)
         print(f"Checkpoint saved to {checkpoint_filename}")
@@ -312,7 +331,12 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     total_timesteps = get_steps_per_env(args.env_id)
-    effective_learning_starts = args.learning_starts if start_step == 0 else (start_step + 1000)
+    effective_learning_starts = args.learning_starts if start_step == 0 else (start_step + 5000)
+    lr_scheduler = CosineAnnealingLR(
+        optimizer=pi_ref_optimizer,
+        T_max=total_timesteps // args.ref_policy_frequency,
+        eta_min=1e-6,
+    ) # TODO: add the learning rate and scheduler state to the checkpoint!
     for global_step in range(start_step, total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -433,7 +457,7 @@ if __name__ == "__main__":
                     # KL-regularized loss
                     # We minimize: KL(pi || pi_ref) - omega * Q
                     # Rewritten: (1/omega) * (log_pi - log_pi_ref) - min_qf_pi
-                    actor_loss = ((1.0 / args.omega) * (log_pi - log_pi_ref) - min_qf_pi).mean()
+                    actor_loss = ((1.0 / omega) * (log_pi - log_pi_ref) - min_qf_pi).mean()
                     # actor_loss = (((alpha + omega) * log_pi) - min_qf_pi).mean() -> old method, didn't explicitly separate pi_ref and actor.
 
                     actor_optimizer.zero_grad()
@@ -442,13 +466,14 @@ if __name__ == "__main__":
 
                     if args.autotune:
                         with torch.no_grad():
-                            _, log_pi, _, _ = actor.get_action(data.observations)
-                        alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+                            _, log_pi, _, random_sample = actor.get_action(data.observations)
+                            log_pi_ref = pi_ref.get_log_prob(data.observations, random_sample)
+                        lambda_loss = (log_lambda.exp() * (-log_pi_ref + log_pi + target_KL)).mean()
 
-                        a_optimizer.zero_grad()
-                        alpha_loss.backward()
-                        a_optimizer.step()
-                        alpha = log_alpha.exp().item()
+                        lambda_optimizer.zero_grad()
+                        lambda_loss.backward()
+                        lambda_optimizer.step()
+                        omega = 1 / (log_lambda.exp().item())
             
             if global_step % args.ref_policy_frequency == 0:  # TD 3 Delayed update support
                 # Update the reference policy.
@@ -468,6 +493,17 @@ if __name__ == "__main__":
                     pi_ref_optimizer.zero_grad()
                     pi_ref_loss.backward()
                     pi_ref_optimizer.step()
+                    lr_scheduler.step()
+
+                    # if args.autotune:
+                    #     with torch.no_grad():
+                    #         _, log_pi, _, _ = actor.get_action(data.observations)
+                    #     alpha_loss = (-log_alpha.exp() * (log_pi + target_entropy)).mean()
+
+                    #     a_optimizer.zero_grad()
+                    #     alpha_loss.backward()
+                    #     a_optimizer.step()
+                    #     alpha = log_alpha.exp().item()
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
@@ -488,11 +524,14 @@ if __name__ == "__main__":
                         "losses/qf_loss": qf_loss.item() / 2.0,
                         "losses/actor_loss": actor_loss.item(),
                         "losses/pi_ref_loss": pi_ref_loss.item(),
-                        "losses/alpha": alpha,
+                        "hyperparams/alpha": alpha,
+                        "hyperparams/omega": omega,
+                        "hyperparams/pi_ref_lr": lr_scheduler.get_last_lr()[0],
                         "charts/SPS": sps,
                     }
                     if args.autotune:
-                        log_dict["losses/alpha_loss"] = alpha_loss.item()
+                        # log_dict["losses/alpha_loss"] = alpha_loss.item()
+                        log_dict["losses/lambda_loss"] = lambda_loss.item()
                     # ONE network call instead of many disk calls
                     wandb.log(log_dict, step=global_step)
             
