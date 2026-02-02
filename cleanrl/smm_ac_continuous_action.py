@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 import tyro
 
 from cleanrl_utils.buffers import ReplayBuffer
@@ -332,11 +332,17 @@ if __name__ == "__main__":
     obs, _ = envs.reset(seed=args.seed)
     total_timesteps = get_steps_per_env(args.env_id)
     effective_learning_starts = args.learning_starts if start_step == 0 else (start_step + 5000)
-    lr_scheduler = CosineAnnealingLR(
+    # lr_scheduler = CosineAnnealingLR(
+    #     optimizer=pi_ref_optimizer,
+    #     T_max=total_timesteps // args.ref_policy_frequency,
+    #     eta_min=1e-6,
+    # ) # TODO: add the learning rate and scheduler state to the checkpoint!
+    lr_scheduler = LinearLR(
         optimizer=pi_ref_optimizer,
-        T_max=total_timesteps // args.ref_policy_frequency,
-        eta_min=1e-6,
-    ) # TODO: add the learning rate and scheduler state to the checkpoint!
+        start_factor=1.0,
+        end_factor=(1e-6 / args.pi_ref_lr), # Decay to 1e-6!
+        total_iters=total_timesteps // args.ref_policy_frequency, # number of times step() is called.
+    )
     for global_step in range(start_step, total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -493,8 +499,16 @@ if __name__ == "__main__":
                     pi_ref_optimizer.zero_grad()
                     pi_ref_loss.backward()
                     pi_ref_optimizer.step()
-                    lr_scheduler.step()
-
+                
+                # Take the fucking scheduler out of the loop ffs...
+                # This is probably why cosine annealing failed hahaha.
+                lr_scheduler.step()
+                # print(lr_scheduler.get_last_lr())
+                    
+                    # Autotune of omega and alpha was terrible! They seemed to
+                    # improve performance, but then would just go to zero or
+                    # infinity. This happens because there is no feedback to
+                    # keep the temperature parameters within some bound...
                     # if args.autotune:
                     #     with torch.no_grad():
                     #         _, log_pi, _, _ = actor.get_action(data.observations)

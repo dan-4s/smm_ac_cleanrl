@@ -36,7 +36,7 @@ trap 'cleanup_handler' SIGUSR1 SIGTERM
 mkdir -p logs
 
 # Create the results directory
-RESULTS_DIR=results_january_30_smm_multi_run
+RESULTS_DIR=results_feb_02_smm_multi_run
 mkdir -p $RESULTS_DIR
 
 # 1. Define parameter arrays
@@ -71,7 +71,7 @@ export MKL_NUM_THREADS=1
 
 # 5. Execution
 echo "Task: $SLURM_ARRAY_TASK_ID | LR: $PI_REF_LR | Freq: $REF_FREQ | N: $N"
-RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_LRSCHED_ref_freq=${REF_FREQ}"
+RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_LIN_SCHED_ref_freq=${REF_FREQ}"
 mkdir -p "${RESULTS_DIR}/${RESULTS_SUB_DIR}"
 
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))
