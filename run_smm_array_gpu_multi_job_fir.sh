@@ -3,8 +3,8 @@
 #SBATCH --account=rrg-bengioy-ad_gpu
 #SBATCH --output=logs/smm_%A_%a.out
 #SBATCH --error=logs/smm_%A_%a.err
-#SBATCH --array=0-20               
-#SBATCH --time=40:00:00
+#SBATCH --array=0-4               
+#SBATCH --time=10:00:00
 #SBATCH --mem=64G                  
 #SBATCH --cpus-per-task=12         # Optimized for Fir's AMD EPYC (6 cores per CCD)
 #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3_1g.10gb:7  # <--- Specific H100 MIG name
@@ -37,7 +37,7 @@ trap 'cleanup_handler' SIGUSR1 SIGTERM
 mkdir -p logs
 
 # Create the results directory
-RESULTS_DIR=results_feb_02_smm_multi_run
+RESULTS_DIR=results_feb_03_smm_multi_run
 mkdir -p $RESULTS_DIR
 
 # Capture the H100 MIG UUIDs
@@ -45,26 +45,29 @@ IFS=',' read -ra MIG_IDS <<< "$CUDA_VISIBLE_DEVICES"
 
 # 1. Define parameter arrays
 # pi_ref_learning_rates=(1e-6 5e-6 1e-5 5e-5) # Length: 4
-pi_ref_freq=(2 4 6)                         # Length: 3
-ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
+# pi_ref_freq=(2 4 6)                         # Length: 1
+ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Walker2d-v4")
+# ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
+
+declare -A ENV_LRS
+ENV_LRS=(
+    ["Ant-v4"]="5e-5"
+    ["HalfCheetah-v4"]="3e-5"
+    ["Hopper-v4"]="5e-6"
+    ["Humanoid-v4"]="5e-5"
+    ["Walker2d-v4"]="5e-5"
+)
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
-# Think of this like nested loops: LR -> Freq -> N -> Repeat
-i_freq=$(( SLURM_ARRAY_TASK_ID % 3 ))
-# i_lr=$(( (SLURM_ARRAY_TASK_ID / 3) % 4 ))
-i_env=$(( SLURM_ARRAY_TASK_ID / 3 ))
-# i_env=$(( SLURM_ARRAY_TASK_ID / 12 ))
-
-# 3. Select values
+i_env=$SLURM_ARRAY_TASK_ID
 ENV=${ENV_LIST[$i_env]}
-PI_REF_LR=1e-5
-# PI_REF_LR=${pi_ref_learning_rates[$i_lr]}
-REF_FREQ=${pi_ref_freq[$i_freq]}
+PI_REF_LR=${ENV_LRS[$ENV]}
 
 # Fixed values
 SMM_VAL="explicit_regulariser" # explicit_regulariser OR empirical_expectation
-ALPHA=1
-OMEGA=20
+REF_FREQ=4
+ALPHA=5
+OMEGA=10
 N=1
 NUM_REPEATS=7
 
@@ -75,7 +78,7 @@ export MKL_NUM_THREADS=1
 
 # 5. Execution
 echo "Task: $SLURM_ARRAY_TASK_ID | LR: $PI_REF_LR | Freq: $REF_FREQ | N: $N"
-RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_LIN_SCHED_ref_freq=${REF_FREQ}"
+RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_ALPHA=${ALPHA}_lr=${PI_REF_LR}"
 mkdir -p "${RESULTS_DIR}/${RESULTS_SUB_DIR}"
 
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))
@@ -103,10 +106,7 @@ do
 done
 
 # 4. Wait for background tasks
-# We use a loop to wait so the script stays alive to catch signals
-while pgrep -P $$ > /dev/null; do 
-    sleep 5
-done
+wait
 echo "All experiments for $ENV completed."
 # ===================
 
