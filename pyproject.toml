@@ -87,6 +87,7 @@ include = [
 include = [
     "cleanrl",
     "cleanrl_utils",
+    "smm_ac_utils",
 ]
 
 [build-system]

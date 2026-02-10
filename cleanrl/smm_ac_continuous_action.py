@@ -232,6 +232,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    total_timesteps = get_steps_per_env(args.env_id)
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
@@ -248,6 +249,17 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
     pi_ref_optimizer = optim.Adam(list(pi_ref.parameters()), lr=args.pi_ref_lr) # Want pi_ref to move very slowly!
+    # lr_scheduler = CosineAnnealingLR(
+    #     optimizer=pi_ref_optimizer,
+    #     T_max=total_timesteps // args.ref_policy_frequency,
+    #     eta_min=1e-6,
+    # )
+    lr_scheduler = LinearLR(
+        optimizer=pi_ref_optimizer,
+        start_factor=1.0,
+        end_factor=(1e-6 / args.pi_ref_lr), # Decay to 1e-6!
+        total_iters=total_timesteps // args.ref_policy_frequency, # number of times step() is called.
+    )
 
     # Automatic entropy tuning
     alpha = args.alpha
@@ -289,6 +301,7 @@ if __name__ == "__main__":
         start_step = ckpt['global_step'] + 1
         qf1_target.load_state_dict(ckpt['qf1_target_state_dict'])
         qf2_target.load_state_dict(ckpt['qf2_target_state_dict'])
+        lr_scheduler.load_state_dict(ckpt['lr_scheduler_state_dict'])
 
     # Signal handler
     global_step = start_step
@@ -309,6 +322,7 @@ if __name__ == "__main__":
             'pi_ref_optimizer_state_dict': pi_ref_optimizer.state_dict(),
             'log_lambda': log_lambda if args.autotune else None,
             'lambda_optimizer_state_dict': lambda_optimizer.state_dict() if args.autotune else None,
+            'lr_scheduler_state_dict': lr_scheduler.state_dict(),
         }
         torch.save(ckpt, checkpoint_filename)
         print(f"Checkpoint saved to {checkpoint_filename}")
@@ -330,19 +344,7 @@ if __name__ == "__main__":
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
-    total_timesteps = get_steps_per_env(args.env_id)
     effective_learning_starts = args.learning_starts if start_step == 0 else (start_step + 5000)
-    # lr_scheduler = CosineAnnealingLR(
-    #     optimizer=pi_ref_optimizer,
-    #     T_max=total_timesteps // args.ref_policy_frequency,
-    #     eta_min=1e-6,
-    # ) # TODO: add the learning rate and scheduler state to the checkpoint!
-    lr_scheduler = LinearLR(
-        optimizer=pi_ref_optimizer,
-        start_factor=1.0,
-        end_factor=(1e-6 / args.pi_ref_lr), # Decay to 1e-6!
-        total_iters=total_timesteps // args.ref_policy_frequency, # number of times step() is called.
-    )
     for global_step in range(start_step, total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -549,7 +551,7 @@ if __name__ == "__main__":
                     # ONE network call instead of many disk calls
                     wandb.log(log_dict, step=global_step)
             
-            if(global_step % 10_000 == 0):
+            if(global_step % 50_000 == 0):
                 write_and_dump(writer=parquet_writer, run_data=run_data)
 
     # Unregister the signals to avoid double-write in case of kill at the end.
@@ -568,6 +570,7 @@ if __name__ == "__main__":
         'q_optimizer_state_dict': q_optimizer.state_dict(),
         'actor_optimizer_state_dict': actor_optimizer.state_dict(),
         'pi_ref_optimizer_state_dict': pi_ref_optimizer.state_dict(),
+        'lr_scheduler_state_dict': lr_scheduler.state_dict(),
     }
     torch.save(ckpt, checkpoint_filename)
 
