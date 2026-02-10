@@ -37,7 +37,7 @@ trap 'cleanup_handler' SIGUSR1 SIGTERM
 mkdir -p logs
 
 # Create the results directory
-RESULTS_DIR=results_feb_03_smm_multi_run
+RESULTS_DIR=results_feb_10_smm_multi_run
 mkdir -p $RESULTS_DIR
 
 # Capture the H100 MIG UUIDs
@@ -52,10 +52,10 @@ ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Walker2d-v4")
 declare -A ENV_LRS
 ENV_LRS=(
     ["Ant-v4"]="5e-5"
-    ["HalfCheetah-v4"]="3e-5"
+    ["HalfCheetah-v4"]="5e-6"
     ["Hopper-v4"]="5e-6"
-    ["Humanoid-v4"]="5e-5"
-    ["Walker2d-v4"]="5e-5"
+    ["Humanoid-v4"]="1e-4"
+    ["Walker2d-v4"]="5e-6"
 )
 
 # 2. Map SLURM_ARRAY_TASK_ID to indices
@@ -66,8 +66,8 @@ PI_REF_LR=${ENV_LRS[$ENV]}
 # Fixed values
 SMM_VAL="explicit_regulariser" # explicit_regulariser OR empirical_expectation
 REF_FREQ=4
-ALPHA=5
-OMEGA=10
+ALPHA=1
+OMEGA=5
 N=1
 NUM_REPEATS=7
 
@@ -78,7 +78,7 @@ export MKL_NUM_THREADS=1
 
 # 5. Execution
 echo "Task: $SLURM_ARRAY_TASK_ID | LR: $PI_REF_LR | Freq: $REF_FREQ | N: $N"
-RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_ALPHA=${ALPHA}_lr=${PI_REF_LR}"
+RESULTS_SUB_DIR="${ENV}__SMM__OMEGA=${OMEGA}_ALPHA=${ALPHA}_COS_lr=${PI_REF_LR}"
 mkdir -p "${RESULTS_DIR}/${RESULTS_SUB_DIR}"
 
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))

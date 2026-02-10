@@ -249,17 +249,17 @@ if __name__ == "__main__":
     q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
     pi_ref_optimizer = optim.Adam(list(pi_ref.parameters()), lr=args.pi_ref_lr) # Want pi_ref to move very slowly!
-    # lr_scheduler = CosineAnnealingLR(
-    #     optimizer=pi_ref_optimizer,
-    #     T_max=total_timesteps // args.ref_policy_frequency,
-    #     eta_min=1e-6,
-    # )
-    lr_scheduler = LinearLR(
+    lr_scheduler = CosineAnnealingLR(
         optimizer=pi_ref_optimizer,
-        start_factor=1.0,
-        end_factor=(1e-6 / args.pi_ref_lr), # Decay to 1e-6!
-        total_iters=total_timesteps // args.ref_policy_frequency, # number of times step() is called.
+        T_max=total_timesteps // args.ref_policy_frequency,
+        eta_min=1e-6,
     )
+    # lr_scheduler = LinearLR(
+    #     optimizer=pi_ref_optimizer,
+    #     start_factor=1.0,
+    #     end_factor=(1e-6 / args.pi_ref_lr), # Decay to 1e-6!
+    #     total_iters=total_timesteps // args.ref_policy_frequency, # number of times step() is called.
+    # )
 
     # Automatic entropy tuning
     alpha = args.alpha
