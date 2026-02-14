@@ -1,15 +1,15 @@
 #!/bin/bash
 #SBATCH --job-name=sac_parallel
-#SBATCH --output=logs/sac_%A_%a.out   # %j is the Job ID
+#SBATCH --output=logs/sac_%A_%a.out
 #SBATCH --error=logs/sac_%A_%a.err
-#SBATCH --ntasks=1                 # One primary task
-#SBATCH --cpus-per-task=5          # 1 CPU per agent repeat
-#SBATCH --gres=gpu:1               # All 5 repeats share this 1 GPU
-#SBATCH --mem=32G                  # Increased memory for 5 agents
-#SBATCH --time=15:00:00
-#SBATCH --requeue                  # <--- 1. Tell Slurm to allow requeuing
-#SBATCH --signal=B:SIGUSR1@120     # <--- 2. Send SIGUSR1 120 seconds before time limit
-#SBATCH --array=0-6
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=5
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
+#SBATCH --time=40:00:00
+#SBATCH --requeue
+#SBATCH --signal=B:SIGUSR1@120
+#SBATCH --array=0-107              # <--- MODIFIED: 6 Envs * 6 LRs * 3 Freqs = 108 jobs
 
 # 0. Define the cleanup/resubmission handler
 cleanup_handler() {
@@ -25,7 +25,7 @@ cleanup_handler() {
         wait $child_pids
     fi
 
-    echo "Requeuing job $SLURM_JOB_ID"
+    echo "Requeuing job $SLURM_ARRAY_JOB_ID index $SLURM_ARRAY_TASK_ID"
     scontrol requeue $SLURM_JOB_ID
     exit 0
 }
@@ -33,55 +33,67 @@ cleanup_handler() {
 # Register the handler for both SIGUSR1 (timeout) and SIGTERM (preemption)
 trap 'cleanup_handler' SIGUSR1 SIGTERM
 
-# Create logs directory.
-mkdir -p logs
+source ~/.bashrc
+source ~/setup_env.sh
+module load OpenSSL/1.1 # Just in case, since we have seen errors from this.
 
-# Create the results directory if it doesn't exist.
-RESULTS_DIR=results_january_28_sac_multi_run
-mkdir -p $RESULTS_DIR
+# --- CONFIGURATION ---
+# Removed Swimmer-v4 and Pusher-v4
+ENV_LIST=("Hopper-v4" "Walker2d-v4" "HalfCheetah-v4" "Ant-v4" "Humanoid-v4" "InvertedDoublePendulum-v4")
+LR_LIST=(1e-5 3e-5 8e-5 1e-4 3e-4 8e-4)
+UP_FREQ_LIST=(2 4 6)
 
-# 1. Configuration
-N=1
-NUM_REPEATS=5 # 10 seems to choke the GPU, we'll see what 5 does.
-ENV_LIST=("Ant-v4" "HalfCheetah-v4" "Hopper-v4" "Humanoid-v4" "Pusher-v4" "Swimmer-v4" "Walker2d-v4")
-ENV=${ENV_LIST[$SLURM_ARRAY_TASK_ID]}
-VAL_EST="explicit_regulariser" # empirical_expectation OR explicit_regulariser
-RESULTS_SUB_DIR="${ENV}__SAC_N=${N}"
+VAL_EST="explicit_regulariser" 
+N=1  # <--- Helper variable for directory naming / args
+NUM_REPEATS=5
+
+# --- INDEXING LOGIC ---
+IDX=$SLURM_ARRAY_TASK_ID
+
+# 1. Update Frequency
+NUM_UP_FREQS=${#UP_FREQ_LIST[@]}
+UP_FREQ_IDX=$(( IDX % NUM_UP_FREQS ))
+UP_FREQ=${UP_FREQ_LIST[$UP_FREQ_IDX]}
+IDX=$(( IDX / NUM_UP_FREQS ))
+
+# 2. LR
+NUM_LRS=${#LR_LIST[@]}
+LR_IDX=$(( IDX % NUM_LRS ))
+LR=${LR_LIST[$LR_IDX]}
+IDX=$(( IDX / NUM_LRS ))
+
+# 3. Environment
+NUM_ENVS=${#ENV_LIST[@]}
+ENV_IDX=$(( IDX % NUM_ENVS ))
+ENV=${ENV_LIST[$ENV_IDX]}
+
+echo "Task ID $SLURM_ARRAY_TASK_ID processing: Env=$ENV | LR=$LR | UpFreq=$UP_FREQ"
+
+RESULTS_SUB_DIR="${ENV}__SAC_LR=${LR}_Freq=${UP_FREQ}"
+RESULTS_DIR="results_feb_13_sac_multi_run"
 mkdir -p "$RESULTS_DIR/$RESULTS_SUB_DIR"
 
-# 2. Prevent library conflicts
-# This stops each process from trying to use all 10 CPUs for math
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 
-echo "Launching $NUM_REPEATS repeats of $ENV in parallel on 1 GPU..."
-
-# 3. Execution Loop
 for i_repeat in $(seq 0 $((NUM_REPEATS - 1)))
 do
-    # Unique identifier for each repeat
     RUN_ID="${RESULTS_SUB_DIR}_r${i_repeat}"
     
-    # Launch in background (&)
     python cleanrl/sac_continuous_action.py \
         --env_id="$ENV" \
         --value_est="$VAL_EST" \
         --num_val_est_samples="$N" \
+        --policy_lr=$LR \
+        --policy_frequency=$UP_FREQ \
         --wandb_project_name="SMM-AC-$ENV" \
-        --wandb_group="${RESULTS_SUB_DIR}" \
+        --wandb_group="$RESULTS_SUB_DIR" \
         --wandb_run_name="${RESULTS_SUB_DIR}_seed${i_repeat}" \
-        --output_filename="${RESULTS_DIR}/${RESULTS_SUB_DIR}/${RUN_ID}" &
+        --output_filename="${RESULTS_DIR}/${RESULTS_SUB_DIR}/${RUN_ID}" \
+        --seed $i_repeat \
+        --track &
     
-    # Short sleep to prevent simultaneous database/file access conflicts
     sleep 2
 done
 
-# 4. Wait for background tasks
-# We use a loop to wait so the script stays alive to catch signals
-while pgrep -P $$ > /dev/null; do 
-    sleep 5
-done
-echo "All experiments completed."
-# ===================
-
-
+wait
